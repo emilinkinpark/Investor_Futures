@@ -1,0 +1,22 @@
+{
+  "D:\\Development\\Investor_Futures\\Investor_Futures-main\\marketpredictor.db": {
+    "table": "marketpredictor",
+    "columns": {
+      "timestamp": "Timestamp",
+      "symbol": "Symbol",
+      "price": "ClosePrice",
+      "volume": "Volume",
+      "adx": "ADX",
+      "di_plus": null,
+      "di_minus": null,
+      "macd": "MACDLine",
+      "vwap": "VWAP",
+      "oi": "OpenInterest",
+      "liq": null,
+      "rsi": "RSI",
+      "funding": "FundingRate",
+      "coin_ls": null,
+      "trader_ls": null
+    }
+  }
+}
