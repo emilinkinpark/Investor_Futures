@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "bot_token": "7313019255:AAHLX7402sOnleA6G8X4zOd81T3ANZD1I8M",
+  "chat_id": "1467753798",
+  "enable_adx_1m": true,
+  "enable_adx_15m": true,
+  "adx_1m_threshold": 50.0,
+  "adx_15m_threshold": 50.0,
+  "require_both_adx": true,
+  "check_interval_sec": 15.0,
+  "cooldown_min": 30.0,
+  "hysteresis": 0.0
+}

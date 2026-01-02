@@ -1,0 +1,13 @@
+{
+  "enable_dca": true,
+  "max_attempts": 1,
+  "trigger_pct": 4.0,
+  "multiplier": 1.5,
+  "scan_interval": 2,
+  "first_dca_usdt": 20.0,
+  "auto_tpsl": true,
+  "long_tp": 40.0,
+  "long_sl": 20.0,
+  "short_tp": 30.0,
+  "short_sl": 20.0
+}
