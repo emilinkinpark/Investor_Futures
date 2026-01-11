@@ -3,4 +3,6 @@
 *.pyc
 *.db
 *.gz
+*.log
+*.sqlite3
 __pycache__/
