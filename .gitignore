@@ -1,5 +1,5 @@
 # .gitignore
-*.env
+.env
 *.pyc
 *.db
 *.gz
