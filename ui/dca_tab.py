@@ -27,6 +27,7 @@ import math
 import time
 import hmac
 import hashlib
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -271,18 +272,260 @@ class DCATab(ttk.Frame):
         # key format: f"{symbol}:{side}" so LONG/SHORT rows are independent
         self._tree_index: Dict[str, str] = {}
 
-        # NEW: track previous position qty to detect open/close transitions for timer
+        # Timer support (entry time tracking)
         self._prev_pos_qty: Dict[str, float] = {}
+        self._entry_ts_map: Dict[str, int] = {}
+        self._age_timer_job = None
+        self._entry_trade_cache: Dict[str, Optional[int]] = {}
+        self._ensure_entry_time_table()
 
         self._build_ui()
         self._load_settings()
-        self._ensure_entry_time_table()
         self._start_ui_refresher()
-        self._start_timer_updater()
+        self._start_age_timer()
 
     # ---------- allow late wiring of TrendingTab ----------
     def set_trending_tab(self, trending_tab):
         self.trending_tab = trending_tab
+
+    # ====================== Position entry time (Timer) ======================
+    def _ensure_entry_time_table(self):
+        try:
+            conn = _sqlite.connect(_sqlite_db_path())
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS position_entry_time (
+                    sym_side TEXT PRIMARY KEY,
+                    symbol   TEXT NOT NULL,
+                    side     TEXT NOT NULL,
+                    entry_ts INTEGER NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_pet_symbol ON position_entry_time(symbol);")
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _sym_side_key(self, symbol: str, side: str) -> str:
+        return f"{symbol}:{side}"
+
+    def _get_entry_ts(self, symbol: str, side: str):
+        """Memory-first lookup; fall back to SQLite. Side is LONG/SHORT."""
+        key = f"{symbol}:{side}"
+        try:
+            if hasattr(self, "_entry_ts_map") and key in self._entry_ts_map:
+                return self._entry_ts_map.get(key)
+        except Exception:
+            pass
+
+        # DB fallback (also supports legacy schema: symbol PRIMARY KEY)
+        try:
+            conn = sqlite3.connect(self._dca_db_path)
+            try:
+                c = conn.cursor()
+                # Try new schema first
+                try:
+                    c.execute("SELECT entry_ts FROM position_entry_time WHERE symbol=? AND side=?", (symbol, side))
+                    row = c.fetchone()
+                    if row:
+                        ts = int(row[0])
+                        if hasattr(self, "_entry_ts_map"):
+                            self._entry_ts_map[key] = ts
+                        return ts
+                except sqlite3.OperationalError:
+                    pass
+
+                # Legacy schema fallback
+                c.execute("SELECT entry_ts FROM position_entry_time WHERE symbol=?", (symbol,))
+                row = c.fetchone()
+                if row:
+                    ts = int(row[0])
+                    if hasattr(self, "_entry_ts_map"):
+                        self._entry_ts_map[key] = ts
+                    return ts
+            finally:
+                conn.close()
+        except Exception:
+            return None
+        return None
+
+    def _set_entry_ts(self, symbol: str, side: str, entry_ts: int):
+        """Set in memory first, then persist to SQLite."""
+        key = f"{symbol}:{side}"
+        try:
+            if not hasattr(self, "_entry_ts_map") or self._entry_ts_map is None:
+                self._entry_ts_map = {}
+            self._entry_ts_map[key] = int(entry_ts)
+        except Exception:
+            pass
+
+        try:
+            conn = sqlite3.connect(self._dca_db_path)
+            try:
+                c = conn.cursor()
+                # New schema
+                try:
+                    c.execute(
+                        """
+                        INSERT INTO position_entry_time(symbol, side, entry_ts)
+                        VALUES(?, ?, ?)
+                        ON CONFLICT(symbol, side) DO UPDATE SET entry_ts=excluded.entry_ts
+                        """,
+                        (symbol, side, int(entry_ts)),
+                    )
+                except sqlite3.OperationalError:
+                    # Legacy schema fallback
+                    c.execute(
+                        """
+                        INSERT INTO position_entry_time(symbol, entry_ts)
+                        VALUES(?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET entry_ts=excluded.entry_ts
+                        """,
+                        (symbol, int(entry_ts)),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            # swallow; memory still has it
+            return
+
+    def _clear_entry_ts(self, symbol: str, side: str):
+        key = f"{symbol}:{side}"
+        try:
+            if hasattr(self, "_entry_ts_map") and self._entry_ts_map is not None:
+                self._entry_ts_map.pop(key, None)
+        except Exception:
+            pass
+
+        try:
+            conn = sqlite3.connect(self._dca_db_path)
+            try:
+                c = conn.cursor()
+                # New schema
+                try:
+                    c.execute("DELETE FROM position_entry_time WHERE symbol=? AND side=?", (symbol, side))
+                except sqlite3.OperationalError:
+                    # Legacy schema fallback
+                    c.execute("DELETE FROM position_entry_time WHERE symbol=?", (symbol,))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            return
+
+    def _fmt_age(self, entry_ts: int) -> str:
+        if not entry_ts:
+            return "-"
+        age = max(0, int(time.time()) - int(entry_ts))
+        hh = age // 3600
+        mm = (age % 3600) // 60
+        ss = age % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    def _derive_entry_ts_from_trades(self, symbol: str, side: str, target_qty: float):
+        """
+        Best-effort derive entry timestamp from Binance userTrades for the *remaining* position size.
+        side: LONG/SHORT. target_qty: absolute position size (contracts).
+        """
+        try:
+            target_qty = abs(float(target_qty or 0.0))
+            if target_qty <= 0:
+                return None
+            # cache per refresh cycle to avoid repeated calls
+            cache_key = f"{symbol}:{side}:{target_qty:.8f}"
+            if getattr(self, "_entry_trade_cache", None) is None:
+                self._entry_trade_cache = {}
+            if cache_key in self._entry_trade_cache:
+                return self._entry_trade_cache[cache_key]
+
+            trades = self._signed("GET", "/fapi/v1/userTrades", {"symbol": symbol, "limit": 200})
+            if not trades:
+                self._entry_trade_cache[cache_key] = None
+                return None
+
+            # sort newest -> oldest
+            trades_sorted = sorted(trades, key=lambda t: int(t.get("time") or 0), reverse=True)
+
+            net = 0.0
+            entry_time_ms = None
+            eps = max(1e-12, target_qty * 1e-6)
+
+            for t in trades_sorted:
+                # Binance userTrades fields:
+                # - side: BUY/SELL
+                # - positionSide: BOTH/LONG/SHORT (present when hedge mode / futures)
+                tside = str(t.get("side") or "").upper()
+                pside = str(t.get("positionSide") or "BOTH").upper()
+
+                # If hedge-mode data is present, only use trades for the relevant side
+                if pside in ("LONG", "SHORT") and pside != side:
+                    continue
+
+                qty = abs(float(t.get("qty") or 0.0))
+                if qty <= 0:
+                    continue
+
+                if side == "LONG":
+                    # BUY increases long, SELL decreases long
+                    delta = qty if tside == "BUY" else -qty
+                else:  # SHORT
+                    # SELL increases short, BUY decreases short
+                    delta = qty if tside == "SELL" else -qty
+
+                net += delta
+                if net + eps >= target_qty:
+                    entry_time_ms = int(t.get("time") or 0)
+                    break
+
+            if entry_time_ms is None:
+                # fallback: oldest trade time in window
+                entry_time_ms = int(trades_sorted[-1].get("time") or 0)
+
+            entry_ts = int(entry_time_ms / 1000) if entry_time_ms else None
+            self._entry_trade_cache[cache_key] = entry_ts
+            return entry_ts
+        except Exception:
+            return None
+
+    def _start_age_timer(self):
+        if getattr(self, "_age_timer_job", None):
+            return
+
+        def _tick():
+            try:
+                self._update_timer_column()
+            finally:
+                self._age_timer_job = self.after(1000, _tick)
+
+        _tick()
+
+    def _update_timer_column(self):
+        """Update only the Timer column values without any REST calls."""
+        try:
+            # Timer column is the last column
+            for iid in self.tree.get_children():
+                vals = list(self.tree.item(iid, "values") or [])
+                if len(vals) < 2:
+                    continue
+                symbol = vals[0]
+                side = vals[1]
+                if side not in ("LONG", "SHORT"):
+                    continue
+                entry_ts = self._get_entry_ts(symbol, side)
+                # timer is last column
+                if vals:
+                    vals[-1] = self._fmt_age(entry_ts)
+                    self.tree.item(iid, values=vals)
+        except Exception:
+            pass
 
     # ====================== UI LAYOUT ======================
     def _build_ui(self):
@@ -367,8 +610,6 @@ class DCATab(ttk.Frame):
         cols = ("symbol","side","size","entry","current","pnl","leverage","margin","tp","sl",
                 "adx","rsi","funding","status","timer")
         self.tree = ttk.Treeview(rf_top, columns=cols, show="headings", height=12)
-        self._tree_cols = cols
-        self._col_index = {name: i for i, name in enumerate(cols)}
         for c, w in [
             ("symbol", 90), ("side", 60), ("size", 80), ("entry", 90), ("current", 90), ("pnl", 110),
             ("leverage", 70), ("margin", 100), ("tp", 90), ("sl", 90),
@@ -400,121 +641,6 @@ class DCATab(ttk.Frame):
 
         sr = ttk.Frame(self); sr.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(sr, textvariable=self.status_var).pack(side="left")
-
-
-    # ====================== Position entry timer (local tracking) ======================
-    def _ensure_entry_time_table(self):
-        try:
-            conn = _sqlite.connect(_sqlite_db_path())
-            cur = conn.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS position_entry_time (
-                    symbol TEXT PRIMARY KEY,
-                    entry_ts INTEGER NOT NULL
-                )
-                """
-            )
-            conn.commit()
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _get_entry_ts(self, symbol: str):
-        try:
-            conn = _sqlite.connect(_sqlite_db_path())
-            cur = conn.cursor()
-            cur.execute("SELECT entry_ts FROM position_entry_time WHERE symbol=?", (symbol,))
-            row = cur.fetchone()
-            return int(row[0]) if row else None
-        except Exception:
-            return None
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _set_entry_ts(self, symbol: str, entry_ts: int):
-        try:
-            conn = _sqlite.connect(_sqlite_db_path())
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO position_entry_time(symbol, entry_ts)
-                VALUES(?, ?)
-                ON CONFLICT(symbol) DO UPDATE SET entry_ts=excluded.entry_ts
-                """,
-                (symbol, int(entry_ts)),
-            )
-            conn.commit()
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _clear_entry_ts(self, symbol: str):
-        try:
-            conn = _sqlite.connect(_sqlite_db_path())
-            cur = conn.cursor()
-            cur.execute("DELETE FROM position_entry_time WHERE symbol=?", (symbol,))
-            conn.commit()
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _fmt_age(self, entry_ts: int) -> str:
-        if not entry_ts:
-            return "-"
-        age = max(0, int(time.time()) - int(entry_ts))
-        hh = age // 3600
-        mm = (age % 3600) // 60
-        ss = age % 60
-        return f"{hh:02d}:{mm:02d}:{ss:02d}"
-
-    def _start_timer_updater(self):
-        if getattr(self, "_timer_job", None):
-            return
-
-        def _tick():
-            try:
-                self._update_timer_cells()
-            finally:
-                self._timer_job = self.after(1000, _tick)
-
-        _tick()
-
-    def _update_timer_cells(self):
-        # Update only the TIMER column to avoid heavy redraws.
-        if not hasattr(self, "tree"):
-            return
-        idx_timer = (getattr(self, "_col_index", {}) or {}).get("timer", None)
-        idx_symbol = (getattr(self, "_col_index", {}) or {}).get("symbol", None)
-        if idx_timer is None or idx_symbol is None:
-            return
-
-        for iid in self.tree.get_children():
-            vals = list(self.tree.item(iid, "values") or [])
-            if len(vals) <= max(idx_timer, idx_symbol):
-                continue
-            symbol = vals[idx_symbol]
-            ts = self._get_entry_ts(symbol)
-            vals[idx_timer] = self._fmt_age(ts)
-            try:
-                self.tree.item(iid, values=vals)
-            except Exception:
-                pass
 
     # ====================== UI helpers ======================
     def _log(self, msg: str):
@@ -597,30 +723,8 @@ class DCATab(ttk.Frame):
                     self._last_positions = list(rows)
 
         display_rows = []
-
-        # Track open/close transitions to set/clear entry timestamp for the Timer column
-        now_ts = int(time.time())
-        current_syms = set()
-        for p in rows:
-            try:
-                sym0 = p.get("symbol", "")
-                if sym0:
-                    current_syms.add(sym0)
-                    qty0 = float(p.get("size") or 0.0)
-                    prev0 = float(self._prev_pos_qty.get(sym0, 0.0))
-                    if prev0 == 0.0 and qty0 != 0.0:
-                        self._set_entry_ts(sym0, now_ts)
-                    if prev0 != 0.0 and qty0 == 0.0:
-                        self._clear_entry_ts(sym0)
-                    self._prev_pos_qty[sym0] = qty0
-            except Exception:
-                pass
-
-        # Symbols that were previously open but no longer in the list -> treat as closed
-        for sym0, prev0 in list(self._prev_pos_qty.items()):
-            if sym0 not in current_syms and float(prev0 or 0.0) != 0.0:
-                self._clear_entry_ts(sym0)
-                self._prev_pos_qty[sym0] = 0.0
+        # reset per-refresh trade cache to avoid unbounded growth
+        self._entry_trade_cache = {}
 
         for p in rows:
             sym = p.get("symbol", "")
@@ -655,6 +759,39 @@ class DCATab(ttk.Frame):
                 else ("No SL" if tp_price else ("No TP" if sl_price else "No TP/SL"))
             )
 
+            # ----- Timer: derive/store entry time -----
+            key = self._sym_side_key(sym, side)
+            signed_qty = size_val if side == "LONG" else -size_val
+            prev_signed = float(self._prev_pos_qty.get(key, 0.0) or 0.0)
+
+            entry_ts = self._get_entry_ts(sym, side)
+
+            # open transition
+            if prev_signed == 0.0 and signed_qty != 0.0:
+                derived = self._derive_entry_ts_from_trades(sym, side, size_val)
+                entry_ts = derived or int(time.time())
+                self._set_entry_ts(sym, side, entry_ts)
+
+            # If open, ensure entry_ts reflects Binance trade-derived entry time (best-effort).
+            # We upgrade an existing "first-seen" timestamp if trade-derived is earlier.
+            if signed_qty != 0.0:
+                derived = self._derive_entry_ts_from_trades(sym, side, size_val)
+                if derived:
+                    if (not entry_ts) or (int(derived) < int(entry_ts) - 5):
+                        entry_ts = int(derived)
+                        self._set_entry_ts(sym, side, entry_ts)
+                else:
+                    # no trades available; fall back only if missing
+                    if not entry_ts:
+                        entry_ts = int(time.time())
+                        self._set_entry_ts(sym, side, entry_ts)
+
+            # update prev
+
+            self._prev_pos_qty[key] = signed_qty
+
+            timer_txt = self._fmt_age(entry_ts)
+
             vals = (
                 sym,
                 side,
@@ -670,9 +807,21 @@ class DCATab(ttk.Frame):
                 (f"{rsi_val:.1f}" if rsi_val is not None else "-"),
                 (f"{fund_rate * 100:.4f}%" if fund_rate is not None else "-"),
                 status,
-                self._fmt_age(self._get_entry_ts(sym)),
+                timer_txt,
             )
             display_rows.append(vals)
+
+
+        # Clear timers for positions no longer present
+        current_keys = {self._sym_side_key(p.get("symbol",""), p.get("side","")) for p in rows if p.get("symbol") and p.get("side")}
+        for k in list(self._prev_pos_qty.keys()):
+            if k not in current_keys:
+                try:
+                    sym, sd = k.split(":", 1)
+                    self._clear_entry_ts(sym, sd)
+                except Exception:
+                    pass
+                self._prev_pos_qty.pop(k, None)
 
         # Simple redraw
         self.tree.delete(*self.tree.get_children())
@@ -776,6 +925,11 @@ class DCATab(ttk.Frame):
         try:
             if self._ui_refresh_job:
                 self.after_cancel(self._ui_refresh_job)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_age_timer_job", None):
+                self.after_cancel(self._age_timer_job)
         except Exception:
             pass
         self._stop_scanner()
@@ -1301,18 +1455,18 @@ class DCATab(ttk.Frame):
         else:
             self._log(f"[TP/SL] {symbol}: one or more orders failed (TP ok={ok_tp}, SL ok={ok_sl}).")
 
-    def _compute_brackets(self, symbol: str, side: str, entry: float) -> Tuple[float, float, str, str]:
+    def _compute_brackets(self, symbol: str, side: str, entry: float) -> Tuple[str, str, str, str]:
         if side == "LONG":
             tp_pct = max(0.0001, float(self.long_tp.get())) / 100.0
             sl_pct = max(0.0001, float(self.long_sl.get())) / 100.0
-            tp_price = self._format_price(symbol, entry * (1.0 + tp_pct))
-            sl_price = self._format_price(symbol, entry * (1.0 - sl_pct))
+            tp_price = self._format_price_str(symbol, entry * (1.0 + tp_pct))
+            sl_price = self._format_price_str(symbol, entry * (1.0 - sl_pct))
             return tp_price, sl_price, "SELL", "SELL"
         else:  # SHORT
             tp_pct = max(0.0001, float(self.short_tp.get())) / 100.0
             sl_pct = max(0.0001, float(self.short_sl.get())) / 100.0
-            tp_price = self._format_price(symbol, entry * (1.0 - tp_pct))
-            sl_price = self._format_price(symbol, entry * (1.0 + sl_pct))
+            tp_price = self._format_price_str(symbol, entry * (1.0 - tp_pct))
+            sl_price = self._format_price_str(symbol, entry * (1.0 + sl_pct))
             return tp_price, sl_price, "BUY", "BUY"
 
     # --------- TP/SL presence detection, TP/SL values, indicators, funding ----------
@@ -1423,49 +1577,66 @@ class DCATab(ttk.Frame):
             self._log(f"[TP/SL] {symbol}: one or more orders failed (TP ok={ok_tp}, SL ok={ok_sl}).")
 
     # ====================== Binance helpers & indicators ======================
+
     def _normalize_params(self, params: dict) -> dict:
-        """Normalize params for Binance: avoid scientific notation and drop None."""
+        """Normalize params for Binance signing and transport (no scientific notation)."""
         out = {}
         for k, v in (params or {}).items():
             if v is None:
                 continue
             if isinstance(v, bool):
                 out[k] = "true" if v else "false"
-            elif isinstance(v, float):
+                continue
+            if isinstance(v, float):
                 s = f"{v:.16f}".rstrip("0").rstrip(".")
                 out[k] = s if s else "0"
-            elif isinstance(v, int):
+                continue
+            if isinstance(v, int):
                 out[k] = v
-            else:
-                out[k] = str(v)
+                continue
+            out[k] = str(v)
         return out
 
     def _signed(self, method: str, path: str, params: dict):
+        """Signed request helper.
+
+        IMPORTANT: Binance validates the signature against the *exact* querystring
+        it receives. Therefore we must ensure the parameter ordering used for the
+        signature matches the ordering sent over the wire. We achieve that by
+        sending params as a list of (key, value) tuples in the same sorted order
+        used to build the signature.
+        """
         ts = int(time.time() * 1000)
 
         params = self._normalize_params(dict(params or {}))
+        # Always set/override timestamp
         params["timestamp"] = ts
 
+        # Canonical ordering for both signature and transport
         items = sorted(params.items(), key=lambda kv: kv[0])
         q = "&".join([f"{k}={v}" for k, v in items])
-        sig = hmac.new(API_SECRET.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        sig = hmac.new(
+            API_SECRET.encode("utf-8"),
+            q.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
 
         headers = {"X-MBX-APIKEY": API_KEY}
         url = f"{BASE_URL}{path}"
 
-        send_params = dict(params)
-        send_params["signature"] = sig
+        # Send in the *same order* we signed
+        ordered = list(items) + [("signature", sig)]
 
         if method == "GET":
-            resp = requests.get(url, params=send_params, headers=headers, timeout=10)
+            resp = requests.get(url, params=ordered, headers=headers, timeout=10)
         elif method == "DELETE":
-            resp = requests.delete(url, params=send_params, headers=headers, timeout=10)
+            resp = requests.delete(url, params=ordered, headers=headers, timeout=10)
         else:
-            resp = requests.post(url, params=send_params, headers=headers, timeout=10)
+            resp = requests.post(url, params=ordered, headers=headers, timeout=10)
 
         resp.raise_for_status()
         return resp.json()
-
 
     def _public_get(self, path: str, params: dict = None):
         return requests.get(f"{BASE_URL}{path}", params=params or {}, timeout=10)
@@ -1491,7 +1662,7 @@ class DCATab(ttk.Frame):
             "symbol": symbol,
             "side": http_side,
             "type": "MARKET",
-            "quantity": qty,
+            "quantity": self._format_qty_str(symbol, float(qty)),
             "reduceOnly": "true",
         }
         if self._is_dual_side():
@@ -1552,6 +1723,58 @@ class DCATab(ttk.Frame):
             return float(price)
         ticks = math.floor(float(price) / tick)
         return round(ticks * tick, 12)
+
+
+    def _price_precision(self, symbol: str) -> int:
+        try:
+            info = self._get_symbol_info(symbol)
+            return int(info.get("pricePrecision", 8))
+        except Exception:
+            return 8
+
+    def _qty_precision(self, symbol: str) -> int:
+        try:
+            info = self._get_symbol_info(symbol)
+            return int(info.get("quantityPrecision", 8))
+        except Exception:
+            return 8
+
+    def _quantize_str(self, value: float, decimals: int, rounding=ROUND_DOWN) -> str:
+        """Quantize a numeric value to fixed decimal places and return a non-scientific string."""
+        q = Decimal("1").scaleb(-int(decimals))  # 10^-decimals
+        d = Decimal(str(value)).quantize(q, rounding=rounding)
+        s = format(d, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s if s else "0"
+
+    def _format_price_str(self, symbol: str, price: float) -> str:
+        """Format a price for Binance transport: tickSize + pricePrecision, returned as string."""
+        try:
+            tick = Decimal(str(self._get_tick(symbol) or 0))
+        except Exception:
+            tick = Decimal("0")
+        if tick > 0:
+            p = Decimal(str(price))
+            ticks = (p / tick).to_integral_value(rounding=ROUND_DOWN)
+            p2 = ticks * tick
+            price = float(p2)
+        dec = self._price_precision(symbol)
+        return self._quantize_str(price, dec, rounding=ROUND_DOWN)
+
+    def _format_qty_str(self, symbol: str, qty: float) -> str:
+        """Format a quantity for Binance transport: stepSize + quantityPrecision, returned as string."""
+        try:
+            step = Decimal(str(self._get_step(symbol) or 0))
+        except Exception:
+            step = Decimal("0")
+        if step > 0:
+            q = Decimal(str(qty))
+            steps = (q / step).to_integral_value(rounding=ROUND_DOWN)
+            q2 = steps * step
+            qty = float(q2)
+        dec = self._qty_precision(symbol)
+        return self._quantize_str(qty, dec, rounding=ROUND_DOWN)
 
     def _fetch_mark_price(self, symbol: str) -> float:
         try:
@@ -1643,7 +1866,7 @@ class DCATab(ttk.Frame):
             "symbol": symbol,
             "side": side_http,
             "type": "MARKET",
-            "quantity": qty,
+            "quantity": self._format_qty_str(symbol, float(qty)),
             "newClientOrderId": client_id,
         }
 
@@ -1701,7 +1924,7 @@ class DCATab(ttk.Frame):
         symbol: str,
         side_http: str,
         ord_type: str,
-        stop_price: float,
+        stop_price: str,
         position_side: Optional[str] = None,
     ) -> bool:
         """

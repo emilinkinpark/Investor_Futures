@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import csv
 import math
+import re
 from collections import defaultdict, deque
 
 from utils.db import connect
@@ -94,9 +95,7 @@ OPTIONAL_FIELDS = [
     "funding",
     "coin_ls",
     "trader_ls",
-]
-
-
+        ]
 def _load_saved_schema(db_path: str):
     try:
         if os.path.exists(SCHEMA_JSON):
@@ -148,16 +147,46 @@ def _detect_table_and_cols(conn):
 
 
 def _to_epoch_seconds(x):
+    """Best-effort conversion of DB timestamp values to epoch seconds.
+
+    Supports:
+      - epoch seconds / epoch milliseconds (int/float)
+      - ISO strings: 'YYYY-MM-DDTHH:MM:SS', with optional 'Z' or offset
+      - Common sqlite text: 'YYYY-MM-DD HH:MM:SS'
+      - Text with trailing tz abbrev like 'YYYY-MM-DD HH:MM:SS ACDT'
+    """
     if isinstance(x, (int, float)):
         return x / 1000.0 if x > 10_000_000_000 else float(x)
+
     if isinstance(x, str):
-        try:
-            dt = datetime.fromisoformat(x.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
-        except Exception:
+        s = x.strip()
+        if not s:
             return float("nan")
+
+        # Strip common trailing timezone abbreviations (ACDT/ACST/UTC/etc.)
+        # Example: '2026-01-03 14:01:22 ACDT' -> '2026-01-03 14:01:22'
+        s2 = re.sub(r"\s+[A-Za-z]{2,5}$", "", s)
+
+        # 1) ISO 8601 (also handles ' ' if present)
+        for candidate in (s, s2, s.replace(" ", "T"), s2.replace(" ", "T")):
+            try:
+                dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                pass
+
+        # 2) Common sqlite datetime without tz
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                dt = datetime.strptime(s2, fmt).replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                pass
+
+        return float("nan")
+
     return float("nan")
 
 
@@ -351,6 +380,98 @@ def _large_tx_proxy(volumes, oi=None):
     return score
 
 
+
+def _momentum_continuation_score(prices, volumes, impulse_window=(80, 20), cons_window=20,
+                                 min_impulse_pct=0.12, max_compression_ratio=0.35):
+    """
+    Detects a Vertical Impulse → Tight Consolidation → Continuation Hold structure.
+
+    Returns tuple:
+        (impulse_pct, compression_ratio, hold_strength, volume_decay, pattern_score)
+
+    Where:
+        impulse_pct: (impulse_high - impulse_low) / impulse_low over impulse window
+        compression_ratio: consolidation_range / impulse_range
+        hold_strength: (last - impulse_midpoint) / impulse_midpoint  (must be >= 0)
+        volume_decay: cons_volume / impulse_volume  (lower is better)
+        pattern_score: weighted composite 0..~1 (not strictly bounded)
+
+    If pattern does not match, returns None.
+    """
+    if not prices or len(prices) < (impulse_window[0] + 5):
+        return None
+    if not volumes:
+        volumes = [0.0] * len(prices)
+
+    # Define impulse slice as: [-impulse_start : -impulse_end]
+    imp_start, imp_end = impulse_window
+    if len(prices) < imp_start + 1:
+        return None
+    imp_slice = prices[-imp_start: -imp_end] if imp_end > 0 else prices[-imp_start:]
+    vol_slice = volumes[-imp_start: -imp_end] if imp_end > 0 else volumes[-imp_start:]
+
+    if not imp_slice or len(imp_slice) < 10:
+        return None
+
+    # Clean NaNs (best effort)
+    imp_vals = [p for p in imp_slice if p is not None and not (isinstance(p, float) and math.isnan(p))]
+    if len(imp_vals) < 10:
+        return None
+
+    impulse_high = max(imp_vals)
+    impulse_low = min(imp_vals)
+    if impulse_low <= 0:
+        return None
+    impulse_range = impulse_high - impulse_low
+    if impulse_range <= 0:
+        return None
+
+    impulse_pct = impulse_range / impulse_low
+    if impulse_pct < min_impulse_pct:
+        return None
+
+    # Consolidation on last cons_window bars
+    if len(prices) < cons_window + 1:
+        return None
+    cons_slice = prices[-cons_window:]
+    cons_vals = [p for p in cons_slice if p is not None and not (isinstance(p, float) and math.isnan(p))]
+    if len(cons_vals) < max(5, cons_window // 2):
+        return None
+
+    cons_high = max(cons_vals)
+    cons_low = min(cons_vals)
+    cons_range = cons_high - cons_low
+    compression_ratio = cons_range / impulse_range if impulse_range > 0 else float("inf")
+    if compression_ratio > max_compression_ratio:
+        return None
+
+    midpoint = impulse_low + 0.5 * impulse_range
+    last = prices[-1]
+    if last is None or (isinstance(last, float) and math.isnan(last)) or midpoint <= 0:
+        return None
+    hold_strength = (float(last) - midpoint) / midpoint
+    if hold_strength < 0:
+        return None
+
+    # Volume decay: consolidation volume vs impulse volume
+    try:
+        imp_vol = sum((v or 0.0) for v in vol_slice)
+        cons_vol = sum((v or 0.0) for v in volumes[-cons_window:])
+        volume_decay = (cons_vol / imp_vol) if imp_vol > 0 else 1.0
+    except Exception:
+        volume_decay = 1.0
+
+    # Weighted score (as per spec)
+    pattern_score = (
+        float(impulse_pct) * 0.35 +
+        (1.0 - float(compression_ratio)) * 0.25 +
+        float(hold_strength) * 0.25 +
+        (1.0 - float(volume_decay)) * 0.15
+    )
+
+    return impulse_pct, compression_ratio, hold_strength, volume_decay, pattern_score
+
+
 # ---------------------------------------------------------------------------
 # UI class
 # ---------------------------------------------------------------------------
@@ -425,7 +546,6 @@ class AnalysisTab(ttk.Frame):
             "Price Breakout Filters",
             "Strong Long/Short",
         ]
-
         for name in tab_names:
             frame = ttk.Frame(self.nb)
             self.nb.add(frame, text=name)
@@ -510,7 +630,7 @@ class AnalysisTab(ttk.Frame):
         elif tab_name == "Chart Patterns":
             add("Score: 0.6×Tight range (tighter=better) + 0.4×Breakout vs prior max.")
         elif tab_name == "Key Support/Resistance":
-            add("Score: Breakout strength + 0.25×Volume z + 0.25×(ADX/100).")
+            add("Momentum continuation scanner: impulse + compression + hold + volume decay (pattern score).")
         elif tab_name == "Support/Resistance":
             add("Excel-style panel: RVOL(8H), Efficiency, VWAP position, 4H change, decay, composite rank.")
         elif tab_name == "Liquidation Heatmaps":
@@ -957,18 +1077,20 @@ class AnalysisTab(ttk.Frame):
             patt.sort(key=lambda x: x[1], reverse=True)
             results["Chart Patterns"] = patt[:10]
 
-            # 4) Key Support/Resistance
+            # 4) Key Support/Resistance (Impulse → Consolidation Continuation)
             sr = []
             for s, d in per_sym.items():
-                sc = _support_resistance_break(d["px"], d["vol"], adx=d["adx"], lookback=lookback)
-                if sc is None or math.isnan(sc):
+                res = _momentum_continuation_score(d["px"], d["vol"])
+                if not res:
                     continue
-                note = "price > prior max with vol/ADX boost" if sc > 0 else "—"
-                sr.append((s, sc, note))
+                imp, comp, hold, vdec, score = res
+                note = f"impulse={imp*100:.2f}%; comp={comp*100:.1f}%; hold={hold*100:.1f}%; vdec={vdec*100:.1f}%"
+                sr.append((s, score, note))
             sr.sort(key=lambda x: x[1], reverse=True)
-            results["Key Support/Resistance"] = sr[:10]
+            results["Key Support/Resistance"] = sr[:20]
 
-            # 5) Liquidation Heatmaps
+
+# 5) Liquidation Heatmaps
             liq_rows = []
             have_liq = any(not math.isnan(x) for d in per_sym.values() for x in d["liq"])
             if have_liq:
@@ -986,15 +1108,13 @@ class AnalysisTab(ttk.Frame):
             comp_bull = self._compute_composite(results)
             results["Composite Alpha"] = comp_bull[:10] if comp_bull else [
                 ("—", float("nan"), "Adjust weights or run analysis.")
-            ]
-
+        ]
             # 7) Composite Alpha (Bearish)
             bear_lists = self._build_bearish_lists(per_sym, lookback)
             comp_bear = self._compute_composite_bearish(bear_lists)
             results["Composite Alpha (Bearish)"] = comp_bear[:10] if comp_bear else [
                 ("—", float("nan"), "Adjust weights or run analysis.")
-            ]
-
+        ]
             self._last_raw = (per_sym, results)
             self._post_results(results)
             # Dependent views that use per_sym directly:
@@ -1560,7 +1680,7 @@ class AnalysisTab(ttk.Frame):
             "rvol_8h_n5",
             "efficiency_8h",
             "efficiency_signal",
-            "vwap_pos",
+            "vwap_pos_pct",
             "rvol_4h_n14",
             "rvol_4h_n6",
             "volume_decay",
@@ -1573,7 +1693,7 @@ class AnalysisTab(ttk.Frame):
             "rvol_8h_n5": (95, "center"),
             "efficiency_8h": (95, "center"),
             "efficiency_signal": (120, "center"),
-            "vwap_pos": (110, "center"),
+            "vwap_pos_pct": (110, "center"),
             "rvol_4h_n14": (110, "center"),
             "rvol_4h_n6": (110, "center"),
             "volume_decay": (110, "center"),
@@ -1588,13 +1708,17 @@ class AnalysisTab(ttk.Frame):
             sr_tree.heading(c, text=text)
             sr_tree.column(c, width=w, anchor=a)
 
+        # Force exact header text to match the reference sheet
+        if "vwap_pos_pct" in cols:
+            sr_tree.heading("vwap_pos_pct", text="VWAP Pos %")
+
         # Tag styles (mimic key highlights)
         sr_tree.tag_configure("coin_cell", background="#d9f2d9")              # light green
         sr_tree.tag_configure("top1", background="#fff4a3")                  # light yellow
         sr_tree.tag_configure("top2", background="#fff4a3")
         sr_tree.tag_configure("hq", background="#ff4fd8")                    # magenta
         sr_tree.tag_configure("eff_hi", background="#fff4a3")                # yellow for Efficiency_Signal standout
-        sr_tree.tag_configure("vwap_pos", background="#d9f2d9")              # green
+        sr_tree.tag_configure("vwap_pos_pct", background="#d9f2d9")              # green
         sr_tree.tag_configure("vwap_neg", background="#f6d7d7")              # light red
 
         # ---- Header 2 ----
@@ -1666,6 +1790,156 @@ class AnalysisTab(ttk.Frame):
             return "—"
         return f"{x:+.2f}%"
 
+
+    # -----------------------------------------------------------------------
+    # Support/Resistance signal persistence (for MAX Dip / forward tracking)
+    # -----------------------------------------------------------------------
+    def _ensure_sr_signal_state(self, conn):
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sr_signal_state (
+                    Symbol TEXT PRIMARY KEY,
+                    Direction TEXT NOT NULL,
+                    SignalTS INTEGER NOT NULL,      -- epoch seconds
+                    EntryPrice REAL NOT NULL,
+                    LastTS INTEGER,
+                    LastPrice REAL,
+                    MaxDipPrice REAL,
+                    MaxDipPct REAL,
+                    MaxProfitPrice REAL,
+                    MaxProfitPct REAL,
+                    UpdatedAt INTEGER
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sr_signal_updated ON sr_signal_state(UpdatedAt)")
+        except Exception:
+            pass
+
+    def _sr_get_state(self, conn, sym: str):
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT Symbol, Direction, SignalTS, EntryPrice, LastTS, LastPrice, MaxDipPrice, MaxDipPct, MaxProfitPrice, MaxProfitPct, UpdatedAt "
+                "FROM sr_signal_state WHERE Symbol=?",
+                (sym,),
+            )
+            return cur.fetchone()
+        except Exception:
+            return None
+
+    def _sr_set_state(
+        self,
+        conn,
+        sym: str,
+        direction: str,
+        signal_ts: int,
+        entry_price: float,
+        last_ts: int | None,
+        last_price: float | None,
+        max_dip_price: float | None,
+        max_dip_pct: float | None,
+        max_profit_price: float | None,
+        max_profit_pct: float | None,
+    ):
+        try:
+            cur = conn.cursor()
+            now = int(time.time())
+            cur.execute(
+                """
+                INSERT INTO sr_signal_state
+                (Symbol, Direction, SignalTS, EntryPrice, LastTS, LastPrice, MaxDipPrice, MaxDipPct, MaxProfitPrice, MaxProfitPct, UpdatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(Symbol) DO UPDATE SET
+                    Direction=excluded.Direction,
+                    SignalTS=excluded.SignalTS,
+                    EntryPrice=excluded.EntryPrice,
+                    LastTS=excluded.LastTS,
+                    LastPrice=excluded.LastPrice,
+                    MaxDipPrice=excluded.MaxDipPrice,
+                    MaxDipPct=excluded.MaxDipPct,
+                    MaxProfitPrice=excluded.MaxProfitPrice,
+                    MaxProfitPct=excluded.MaxProfitPct,
+                    UpdatedAt=excluded.UpdatedAt
+                """,
+                (
+                    sym,
+                    direction,
+                    int(signal_ts),
+                    float(entry_price),
+                    int(last_ts) if last_ts is not None else None,
+                    float(last_price) if last_price is not None else None,
+                    float(max_dip_price) if max_dip_price is not None else None,
+                    float(max_dip_pct) if max_dip_pct is not None else None,
+                    float(max_profit_price) if max_profit_price is not None else None,
+                    float(max_profit_pct) if max_profit_pct is not None else None,
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+    def _sr_compute_forward_metrics(self, conn, sym: str, table: str, cols: dict, signal_ts: int, entry_price: float):
+        """Compute max dip / max profit since signal_ts using the raw DB series.
+
+        Uses a bounded lookback (latest 5000 rows) for performance.
+        """
+        try:
+            cur = conn.cursor()
+            q = f'''
+                SELECT "{cols["timestamp"]}", "{cols["price"]}"
+                FROM "{table}"
+                WHERE "{cols["symbol"]}" = ?
+                ORDER BY "{cols["timestamp"]}" DESC
+                LIMIT 5000
+            '''
+            cur.execute(q, (sym,))
+            rows = cur.fetchall()
+            if not rows:
+                return None
+
+            # rows are DESC; iterate reversed for chronological
+            min_px = None
+            max_px = None
+            last_px = None
+            last_ts = None
+
+            for ts_val, px_val in reversed(rows):
+                t = _to_epoch_seconds(ts_val)
+                if math.isnan(t):
+                    continue
+                if t < signal_ts:
+                    continue
+                if px_val is None:
+                    continue
+                px = float(px_val)
+                last_px = px
+                last_ts = int(t)
+                min_px = px if min_px is None else min(min_px, px)
+                max_px = px if max_px is None else max(max_px, px)
+
+            if min_px is None or max_px is None:
+                return None
+
+            max_dip_pct = (min_px - entry_price) / entry_price * 100.0
+            max_profit_pct = (max_px - entry_price) / entry_price * 100.0
+            cur_profit_pct = (last_px - entry_price) / entry_price * 100.0 if last_px is not None else float("nan")
+
+            return dict(
+                last_ts=last_ts,
+                last_px=last_px,
+                min_px=min_px,
+                max_px=max_px,
+                max_dip_pct=max_dip_pct,
+                max_profit_pct=max_profit_pct,
+                cur_profit_pct=cur_profit_pct,
+            )
+        except Exception:
+            return None
+
+
     def _compute_sr_snapshot(self, per_sym: dict):
         """
         Produces rows for the Support/Resistance snapshot from per_sym series.
@@ -1687,14 +1961,32 @@ class AnalysisTab(ttk.Frame):
                     s += (v or 0.0)
             return s
 
+        def count_in_window(ts, start_t):
+            """Count samples at/after start_t; used as a fallback when volume is missing."""
+            n = 0
+            for t in ts:
+                if t >= start_t:
+                    n += 1
+            return n
+
         def price_at_or_before(ts, px, target):
-            # last price at/before target
-            p = px[0] if px else float("nan")
+            """Return last non-null price at/before target.
+
+            Some DBs have NULL/None in early rows; ensure we skip those so 8H
+            efficiency does not become NaN.
+            """
+            p = float("nan")
             for t, v in zip(ts, px):
                 if t <= target:
-                    p = v
+                    if v is not None:
+                        p = v
                 else:
                     break
+            if math.isnan(p):
+                # fallback: nearest non-null (oldest available)
+                for v in px:
+                    if v is not None:
+                        return v
             return p
 
         rows = []
@@ -1714,12 +2006,21 @@ class AnalysisTab(ttk.Frame):
             # 8H RVOL vs previous 5 x 8H windows
             w8 = 8 * 3600
             vol_8h = sum_in_window(ts, vol, t_now - w8)
+            # If volume is missing (NULL in DB / not mapped in Schema Wizard),
+            # fall back to bar-count so Efficiency and RVOL can still populate.
+            vol_fallback = False
+            if (not vol) or (vol_8h <= 0):
+                vol_8h = float(count_in_window(ts, t_now - w8))
+                vol_fallback = True
             prev = []
             # previous 5 windows: [8h..16h], [16h..24h], ...
             for i in range(1, 6):
                 end = t_now - (i * w8)
                 start = end - w8
-                prev.append(sum_in_window(ts, vol, start) - sum_in_window(ts, vol, end))
+                if vol_fallback:
+                    prev.append(float(count_in_window(ts, start) - count_in_window(ts, end)))
+                else:
+                    prev.append(sum_in_window(ts, vol, start) - sum_in_window(ts, vol, end))
             base_8h = (sum(prev) / len(prev)) if prev and sum(prev) > 0 else float("nan")
             rvol_8h = (vol_8h / base_8h) if base_8h and not math.isnan(base_8h) and base_8h > 0 else float("nan")
 
@@ -1740,7 +2041,16 @@ class AnalysisTab(ttk.Frame):
             eff_x = eff_raw * 50.0 if not math.isnan(eff_raw) else float("nan")
 
             # Efficiency_Signal: combine eff + rvol + VWAP alignment
-            vwap_pos = "Positive" if (not math.isnan(vwap_now) and p_now >= vwap_now) else "Negative"
+            # Numeric VWAP position % (to match Excel "VWAP Pos %")
+            vwap_pos_pct = float("nan")
+            if not (math.isnan(vwap_now) or vwap_now == 0 or p_now is None):
+                try:
+                    vwap_pos_pct = ((float(p_now) - float(vwap_now)) / float(vwap_now)) * 100.0
+                except Exception:
+                    vwap_pos_pct = float("nan")
+
+            # Keep categorical flag for gating / ranking
+            vwap_pos = "Positive" if (not math.isnan(vwap_pos_pct) and vwap_pos_pct >= 0) else "Negative"
             vwap_gate = 1.0 if vwap_pos == "Positive" else 0.6
             eff_sig = (eff_x * (1.0 + (math.log1p(rvol_8h) if not math.isnan(rvol_8h) else 0.0)) * vwap_gate) if not math.isnan(eff_x) else float("nan")
             # compress to screenshot-like range
@@ -1754,11 +2064,16 @@ class AnalysisTab(ttk.Frame):
 
             # 4H RVOL vs previous 6 windows
             vol_4h = sum_in_window(ts, vol, t_now - w4)
+            if (not vol) or (vol_4h <= 0):
+                vol_4h = float(count_in_window(ts, t_now - w4))
             prev4 = []
             for i in range(1, 7):
                 end = t_now - (i * w4)
                 start = end - w4
-                prev4.append(sum_in_window(ts, vol, start) - sum_in_window(ts, vol, end))
+                if not vol:
+                    prev4.append(float(count_in_window(ts, start) - count_in_window(ts, end)))
+                else:
+                    prev4.append(sum_in_window(ts, vol, start) - sum_in_window(ts, vol, end))
             base_4h = (sum(prev4) / len(prev4)) if prev4 and sum(prev4) > 0 else float("nan")
             rvol_4h = (vol_4h / base_4h) if base_4h and not math.isnan(base_4h) and base_4h > 0 else float("nan")
 
@@ -1766,6 +2081,9 @@ class AnalysisTab(ttk.Frame):
             w1 = 3600
             vol_1h = sum_in_window(ts, vol, t_now - w1)
             prev_1h = sum_in_window(ts, vol, t_now - 2*w1) - sum_in_window(ts, vol, t_now - w1)
+            if (not vol) or (vol_1h <= 0):
+                vol_1h = float(count_in_window(ts, t_now - w1))
+                prev_1h = float(count_in_window(ts, t_now - 2*w1) - count_in_window(ts, t_now - w1))
             vdec = (vol_1h / prev_1h) if prev_1h and prev_1h > 0 else float("nan")
 
             # Rank: weighted composite (compressed to ~0.3x–1.5x)
@@ -1793,12 +2111,15 @@ class AnalysisTab(ttk.Frame):
                     eff_x=eff_x,
                     eff_sig=eff_sig,
                     vwap_pos=vwap_pos,
+                    vwap_pos_pct=vwap_pos_pct,
                     chg_4h=chg_4h,
                     rvol_4h=rvol_4h,
                     vdec=vdec,
                     rank_x=rank_x,
                     signal_quality=sig_quality,
                     rsi_last=(rsi[-1] if rsi else float("nan")),
+                    last_ts=int(t_now),
+                    last_px=float(p_now) if p_now is not None else float("nan"),
                 )
             )
 
@@ -1844,10 +2165,10 @@ class AnalysisTab(ttk.Frame):
                 r["coin"],
                 r["top_ranking"],
                 r["signal_quality"],
-                r["rvol_label"] if r["rvol_label"] in ("Top-1", "Top-2") else "Normal",
+                self._fmt_x(r["rvol_8h"]),
                 self._fmt_x(r["eff_x"]),
                 f"{r['eff_sig']:.2f}" if not math.isnan(r["eff_sig"]) else "—",
-                r["vwap_pos"],
+                self._fmt_pct(r.get("vwap_pos_pct", float("nan"))),
                 self._fmt_pct(r["chg_4h"]),
                 self._fmt_x(r["rvol_4h"]),
                 self._fmt_x(r["vdec"]),
@@ -1864,7 +2185,7 @@ class AnalysisTab(ttk.Frame):
                 tags.append("hq")
             if not math.isnan(r["eff_sig"]) and r["eff_sig"] >= 1.30:
                 tags.append("eff_hi")
-            tags.append("vwap_pos" if r["vwap_pos"] == "Positive" else "vwap_neg")
+            tags.append("vwap_pos_pct" if r["vwap_pos"] == "Positive" else "vwap_neg")
 
             sr_tree.insert("", "end", values=vals, tags=tuple(tags))
 
@@ -1884,6 +2205,120 @@ class AnalysisTab(ttk.Frame):
             qindex = "GoodQuality" if r["vwap_pos"] == "Positive" else "—"
             bkl = int(60 + 30 * (r["rank_x"] if not math.isnan(r["rank_x"]) else 0.0))
 
+            # Persist / update signal state + compute MAX Dip / forward PnL
+            max_dip_str = ""
+            profit_str = ""
+            result_time_str = ""
+
+            try:
+                dbp = self.db_path_var.get().strip()
+                if os.path.exists(dbp) and self._schema:
+                    conn2 = connect(dbp)
+                    try:
+                        self._ensure_sr_signal_state(conn2)
+
+                        state = self._sr_get_state(conn2, sym)
+                        now_ts = int(r.get("last_ts") or 0)
+                        now_px = float(r.get("last_px")) if r.get("last_px") is not None else float("nan")
+
+                        # Create a new signal if none exists, or if the previous one is stale (>12h)
+                        if (state is None) or (now_ts and int(state[2]) and (now_ts - int(state[2]) > 12 * 3600)):
+                            signal_ts = now_ts if now_ts else int(time.time())
+                            entry_price = now_px if not math.isnan(now_px) else None
+                            self._sr_set_state(
+                                conn2,
+                                sym,
+                                "LONG",
+                                signal_ts,
+                                entry_price if entry_price is not None else 0.0,
+                                now_ts if now_ts else None,
+                                now_px if not math.isnan(now_px) else None,
+                                now_px if not math.isnan(now_px) else None,
+                                0.0,
+                                now_px if not math.isnan(now_px) else None,
+                                0.0,
+                            )
+                            state = self._sr_get_state(conn2, sym)
+
+                        if state is not None and self._schema:
+                            signal_ts = int(state[2])
+                            entry_price = float(state[3])
+                            fm = self._sr_compute_forward_metrics(
+                                conn2,
+                                sym,
+                                self._schema["table"],
+                                self._schema["columns"],
+                                signal_ts,
+                                entry_price,
+                            )
+                            if fm:
+                                max_dip_str = f"{fm['max_dip_pct']:+.2f}%"
+                                profit_str = f"{fm['cur_profit_pct']:+.2f}%"
+                                result_time_str = datetime.fromtimestamp(fm["last_ts"], ADELAIDE_TZ).strftime("%H:%M:%S") if fm.get("last_ts") else ""
+                                # Persist latest extremes
+                                self._sr_set_state(
+                                    conn2,
+                                    sym,
+                                    "LONG",
+                                    signal_ts,
+                                    entry_price,
+                                    fm.get("last_ts"),
+                                    fm.get("last_px"),
+                                    fm.get("min_px"),
+                                    fm.get("max_dip_pct"),
+                                    fm.get("max_px"),
+                                    fm.get("max_profit_pct"),
+                                )
+                    finally:
+                        try:
+                            conn2.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # --- SCD Rating Index (0-100) ---
+            # This is a quality/risk score for the VIP Buy Signal row.
+            # We do not have a native "SCD" column in marketpredictor.db, so we compute it deterministically
+            # from the currently available VIP metrics (signal quality, quality index, RSI, INV index, and BKL time zone).
+            def _calc_scd_index(_sigq: str, _qindex: str, _rsi: float, _inv: float, _bkl: float) -> float:
+                score = 50.0
+                # Signal quality (1CR..4CR) weight
+                try:
+                    if _sigq and "CR_" in _sigq:
+                        n = int(_sigq.split("CR_", 1)[0])
+                        score += {1: 6.0, 2: 12.0, 3: 18.0, 4: 24.0}.get(n, 0.0)
+                except Exception:
+                    pass
+                # QualityIndex boost
+                if _qindex == "GoodQuality":
+                    score += 8.0
+                # RSI preference for LONG: best around 55-65, penalize extremes
+                if not math.isnan(_rsi):
+                    # triangular peak at 60, width 30 (45..75)
+                    score += max(0.0, 20.0 - (abs(_rsi - 60.0) / 15.0) * 20.0)
+                    if _rsi >= 80.0:
+                        score -= 10.0
+                    if _rsi <= 30.0:
+                        score -= 10.0
+                # INV index: small boost (typical ~0.1); cap to avoid domination
+                try:
+                    score += max(0.0, min(10.0, (_inv / 0.15) * 10.0))
+                except Exception:
+                    pass
+                # BKL time zone: preferred 50-110; penalize outside
+                try:
+                    if 50.0 <= float(_bkl) <= 110.0:
+                        score += 8.0
+                    elif float(_bkl) > 120.0:
+                        score -= 6.0
+                except Exception:
+                    pass
+                # Clamp
+                return max(0.0, min(100.0, score))
+
+            scd_val = _calc_scd_index(sigq, qindex, rsi_val, inv_index, bkl)
+            scd_str = f"{scd_val:.1f}"
             vals = (
                 idx,
                 sym,
@@ -1892,11 +2327,11 @@ class AnalysisTab(ttk.Frame):
                 sigq,
                 qindex,
                 f"{rsi_val:.2f}" if not math.isnan(rsi_val) else "—",
-                "",  # SCD Rating Index (not enough info in DB)
+                scd_str,  # SCD Rating Index (computed)
                 f"{bkl}",
-                "",  # MAX Dip
-                "",  # Total Profit
-                "",  # Result Time
+                max_dip_str,
+                profit_str,
+                result_time_str,
             )
             tags = []
             if qindex == "GoodQuality":

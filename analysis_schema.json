@@ -1,10 +1,10 @@
 {
-  "D:\\Development\\Investor_Futures\\Investor_Futures-main\\marketpredictor.db": {
+  "C:\\Users\\Administrator\\Documents\\Binance Trade\\AppDevelopment13.0\\binance_futures_trader\\marketpredictor.db": {
     "table": "marketpredictor",
     "columns": {
       "timestamp": "Timestamp",
       "symbol": "Symbol",
-      "price": "ClosePrice",
+      "price": "CurrentPrice",
       "volume": "Volume",
       "adx": "ADX",
       "di_plus": null,

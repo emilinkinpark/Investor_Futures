@@ -277,6 +277,26 @@ def ensure_schema_upgrade():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_liq_time ON liquidations(timestamp)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_liq_symbol_time ON liquidations(Symbol, timestamp)")
 
+        # Support/Resistance signal persistence (for Max Dip / forward tracking)
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS sr_signal_state (
+            Symbol TEXT PRIMARY KEY,
+            Direction TEXT NOT NULL,
+            SignalTS INTEGER NOT NULL,      -- epoch seconds
+            EntryPrice REAL NOT NULL,
+            LastTS INTEGER,
+            LastPrice REAL,
+            MaxDipPrice REAL,
+            MaxDipPct REAL,
+            MaxProfitPrice REAL,
+            MaxProfitPct REAL,
+            UpdatedAt INTEGER
+        )"""
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_signal_updated ON sr_signal_state(UpdatedAt)")
+
+
         # schema upgrade for existing DBs
         cols = _table_columns("marketpredictor")
 
@@ -347,6 +367,7 @@ def archive_if_month_changed():
         cur = con.cursor()
 
         cur.execute("DROP TABLE IF EXISTS marketpredictor")
+        cur.execute("DROP TABLE IF EXISTS sr_signal_state")
         cur.execute(
             """
         CREATE TABLE marketpredictor (
@@ -400,6 +421,26 @@ def archive_if_month_changed():
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_liq_time ON liquidations(timestamp)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_liq_symbol_time ON liquidations(Symbol, timestamp)")
+
+        # Support/Resistance signal persistence (for Max Dip / forward tracking)
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS sr_signal_state (
+            Symbol TEXT PRIMARY KEY,
+            Direction TEXT NOT NULL,
+            SignalTS INTEGER NOT NULL,
+            EntryPrice REAL NOT NULL,
+            LastTS INTEGER,
+            LastPrice REAL,
+            MaxDipPrice REAL,
+            MaxDipPct REAL,
+            MaxProfitPrice REAL,
+            MaxProfitPct REAL,
+            UpdatedAt INTEGER
+        )"""
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_signal_updated ON sr_signal_state(UpdatedAt)")
+
 
         cur.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('month', ?)",

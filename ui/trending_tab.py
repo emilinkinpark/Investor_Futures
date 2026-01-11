@@ -224,6 +224,72 @@ def _get_funding_rate(symbol: str) -> Optional[float]:
         return None
 
 
+def _get_funding_rate_history(symbol: str, start_ms: int, end_ms: int, limit: int = 1000):
+    """
+    Returns funding events (time[], rate[]) between start_ms and end_ms.
+    /fapi/v1/fundingRate is event-based (typically every 8 hours).
+    """
+    out_t = []
+    out_r = []
+    try:
+        cur = int(start_ms)
+        end_ms = int(end_ms)
+        limit = min(int(limit), 1000)
+
+        while cur <= end_ms:
+            data = rest_client.get_json(
+                "/fapi/v1/fundingRate",
+                params={"symbol": symbol, "startTime": cur, "endTime": end_ms, "limit": limit},
+            )
+            if not data:
+                break
+
+            for d in data:
+                ft = d.get("fundingTime")
+                fr = d.get("fundingRate")
+                if ft is None or fr is None:
+                    continue
+                ft_i = int(ft)
+                out_t.append(datetime.fromtimestamp(ft_i / 1000, tz=ADEL))
+                out_r.append(float(fr))
+
+            last_ft = int(data[-1].get("fundingTime", cur))
+            cur = last_ft + 1  # advance to avoid repeating the last record
+
+            # safety: if API returns non-advancing timestamps
+            if cur <= start_ms:
+                break
+
+    except Exception:
+        return [], []
+
+    return out_t, out_r
+
+
+def _funding_step_series_on_candles(candle_times, fund_times, fund_rates):
+    """
+    Build a per-candle funding series by forward-filling the last funding event.
+    Returns decimal funding per candle (e.g. 0.0001), length == len(candle_times).
+    """
+    if not candle_times:
+        return []
+    if not fund_times or not fund_rates:
+        return [None] * len(candle_times)
+
+    series = [None] * len(candle_times)
+    j = 0
+
+    for i, ct in enumerate(candle_times):
+        while (j + 1) < len(fund_times) and fund_times[j + 1] <= ct:
+            j += 1
+        if fund_times[j] <= ct:
+            series[i] = fund_rates[j]
+        else:
+            series[i] = None
+
+    return series
+
+
 def _get_klines(symbol: str, interval: str, limit: int = 500):
     return rest_client.get_json(
         "/fapi/v1/klines",
@@ -1302,20 +1368,30 @@ class AllTrendingFrame(ttk.Frame):
         def work():
             try:
                 kl = _get_klines(sym, interval, limit)
-                t,o,h,l,c,v = _to_series_from_klines(kl)
+                t, o, h, l, c, v = _to_series_from_klines(kl)
+
                 rsi = _rsi(c, 14)
                 macd, macd_sig, macd_hist = _macd(c)
                 adx = _adx(h, l, c, 30)
 
-                period_map = {"1m":"5m","3m":"5m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"4h","1d":"1d"}
+                period_map = {
+                    "1m": "5m", "3m": "5m", "5m": "5m",
+                    "15m": "15m", "30m": "30m",
+                    "1h": "1h", "4h": "4h", "1d": "1d"
+                }
                 p = period_map.get(interval, "15m")
+
                 t_coin, v_coin = _get_global_ls_series(sym, period=p, limit=limit)
                 t_trader, v_trader = _get_toptrader_ls_series(sym, period=p, limit=limit)
 
-                fr = _get_funding_rate(sym)  # decimal, e.g., -0.003481 == -0.3481%
-                funding_series_pct = [(fr*100.0)] * len(t) if fr is not None else []
+                # ---- FUNDING HISTORY FIX ----
+                start_ms = int(kl[0][0])
+                end_ms = int(kl[-1][0])
 
-                # cache for export (keep both decimal & percent)
+                t_fund, r_fund = _get_funding_rate_history(sym, start_ms, end_ms)
+                funding_dec = _funding_step_series_on_candles(t, t_fund, r_fund)
+                funding_pct = [(x * 100.0) if x is not None else None for x in funding_dec]
+
                 df = pd.DataFrame({
                     "time": t,
                     "open": o,
@@ -1328,27 +1404,28 @@ class AllTrendingFrame(ttk.Frame):
                     "macd_signal": macd_sig,
                     "macd_hist": macd_hist,
                     "adx": adx,
-                    "funding_rate_decimal": ([fr]*len(t)) if fr is not None else None,
-                    "funding_rate_pct": funding_series_pct if funding_series_pct else None,
+                    "funding_rate_decimal": funding_dec,
+                    "funding_rate_pct": funding_pct,
                 })
+
                 df["coin_ls"] = None
                 if t_coin:
                     m = {tt.replace(second=0, microsecond=0): val for tt, val in zip(t_coin, v_coin)}
                     df["coin_ls"] = [m.get(tt.replace(second=0, microsecond=0)) for tt in t]
+
                 df["trader_ls"] = None
                 if t_trader:
                     m2 = {tt.replace(second=0, microsecond=0): val for tt, val in zip(t_trader, v_trader)}
                     df["trader_ls"] = [m2.get(tt.replace(second=0, microsecond=0)) for tt in t]
+
                 self.last_df = df
 
                 on_tk(self, lambda: self._plot_all(
                     t, c, rsi, macd, macd_sig, macd_hist, adx,
                     t_coin, v_coin, t_trader, v_trader,
-                    funding_series_pct
+                    funding_pct
                 ))
-                on_tk(self, self.status.set,
-                      f"Fetched {len(c)} bars. Funding: {fr*100:.4f}%"
-                      if fr is not None else f"Fetched {len(c)} bars. Funding: —")
+
             except Exception as e:
                 on_tk(self, self.status.set, f"Fetch failed: {e}")
         threading.Thread(target=work, daemon=True).start()
