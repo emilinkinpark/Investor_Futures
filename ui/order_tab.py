@@ -17,6 +17,7 @@ class OrderTab(tk.Frame):
     def __init__(self, master, current_symbol=None, price_callback=None):
         super().__init__(master)
         self.current_symbol = current_symbol
+        self._last_symbol = None              # Track previous symbol to detect changes
         self.position_side = "LONG"
         self.order_type = "MARKET"
 
@@ -249,29 +250,54 @@ class OrderTab(tk.Frame):
 
     # ---------- Conversions ----------
     def calculate_quantity_from_usdt(self, _event=None):
+        """
+        USDT Value → Quantity: When user enters target USDT amount,
+        compute and update quantity only. PRESERVE the USDT input as source of truth.
+        """
         try:
-            usdt = float(self.usdt_entry.get() or 0)
+            target_usdt = float(self.usdt_entry.get() or 0)
             price = self._active_price_for_calc()
+            
             if price <= 0:
+                # Show user what's wrong instead of silent fail
+                self.qty_entry.delete(0, tk.END)
+                self.qty_entry.insert(0, "No price")
                 return
-            raw_qty = usdt / price
+            
+            # Compute quantity from target USDT amount
+            raw_qty = target_usdt / price
             qty = self.format_quantity(raw_qty, self.current_symbol)
+            
+            # Update QUANTITY field only (preserve USDT input)
             self.qty_entry.delete(0, tk.END)
             self.qty_entry.insert(0, f"{qty}")
-            self._update_usdt_display(qty, price)
+            
         except ValueError:
             pass
 
     def calculate_usdt_from_quantity(self, _event=None):
+        """
+        Quantity → USDT Value: When user edits quantity, compute USDT notional.
+        Uses formatted quantity for accurate display.
+        """
         try:
             qty = float(self.qty_entry.get() or 0)
             price = self._active_price_for_calc()
+            
             if price <= 0:
+                # Show user what's wrong instead of silent fail
+                self.usdt_entry.delete(0, tk.END)
+                self.usdt_entry.insert(0, "No price")
                 return
+            
+            # Format quantity to exchange step size (for accurate calculation)
             qty = self.format_quantity(qty, self.current_symbol)
-            self.qty_entry.delete(0, tk.END)
-            self.qty_entry.insert(0, f"{qty}")
-            self._update_usdt_display(qty, price)
+            
+            # Calculate USDT notional and update USDT field
+            usdt_notional = qty * price
+            self.usdt_entry.delete(0, tk.END)
+            self.usdt_entry.insert(0, f"{usdt_notional:.2f}")
+            
         except ValueError:
             pass
 
@@ -690,13 +716,30 @@ class OrderTab(tk.Frame):
         self.update_price_display()
 
     def update_symbol(self, symbol):
+        """
+        Update symbol and clear Quantity/USDT fields when switching coins.
+        This ensures fresh entry for each new trading pair.
+        """
+        # Detect if symbol actually changed
+        if symbol != self._last_symbol:
+            # Clear Quantity field
+            self.qty_entry.delete(0, tk.END)
+            
+            # Clear USDT Value field  
+            self.usdt_entry.delete(0, tk.END)
+            
+            print(f"Cleared fields: {self._last_symbol} → {symbol}")
+            
+            # Update tracking
+            self._last_symbol = symbol
+            
+            # Reset price display
+            if symbol:
+                self.current_price = 0.0
+                self.price_display.config(text="Price: -", fg='black')
+        
+        # Always update the current symbol reference
         self.current_symbol = symbol
-        if symbol:
-            self.current_price = 0.0
-            self.price_display.config(text="Price: -", fg='black')
-            # Preload symbol filters in the background (no UI blocking)
-            self._preload_symbol_info(symbol)
-            self.force_refresh()
 
     def destroy(self):
         if self.price_updater:
