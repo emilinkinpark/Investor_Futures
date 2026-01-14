@@ -15,12 +15,29 @@ from threading import Thread
 
 from config import BASE_URL, API_KEY, API_SECRET
 from services.position_logger import PositionLogger
+from services.paper_broker import PaperBroker
+
 
 
 class TradingTab(tk.Frame):
+    def _schedule_sim_positions_refresh(self):
+        if self._sim_ui_refresh_scheduled:
+            return
+        self._sim_ui_refresh_scheduled = True
+
+        def _do():
+            self._sim_ui_refresh_scheduled = False
+            self.refresh_positions_async()
+
+        self.after(self._sim_ui_refresh_interval_ms, _do)
+
     def __init__(self, master, ws_manager=None):
         super().__init__(master)
-
+        # --- legacy attribute aliases for SIM / ws handlers ---
+        self.currentsymbol = None          # alias to current_symbol, kept in sync below
+        self.pricedata = {}                # alias to price_data
+        self.refreshpositionsasync = self.refresh_positions_async
+        self.updatesymbolinfo = self.update_symbol_info
         self.current_symbol = None
         self.ws_manager = ws_manager
         self._owns_ws_manager = ws_manager is None
@@ -35,6 +52,16 @@ class TradingTab(tk.Frame):
         self._mark_price_updater_running = False
         self._positions_refresh_in_flight = False
 
+        self._sim_ui_refresh_scheduled = False
+        self._sim_ui_refresh_interval_ms = 1000
+
+        self.execution_mode_var = tk.StringVar(value="LIVE")  # LIVE | SIM
+        self.paper_broker = PaperBroker(fee_bps=4.0)
+        
+        # now add legacy aliases
+        self.executionmodevar = self.execution_mode_var
+        self.paperbroker = self.paper_broker
+
         self.trending_tab = None
 
         self._prev_positions = {}
@@ -45,6 +72,19 @@ class TradingTab(tk.Frame):
         self.logger = PositionLogger()
 
         self.create_widgets()
+
+        # Ensure websocket is running and callbacks point here (even if ws_manager was passed in)
+        if self.ws_manager:
+            try:
+                self.ws_manager.on_message_callback = self.handle_ws_message
+            except Exception:
+                pass
+            try:
+                self.ws_manager.start()
+            except Exception:
+                pass
+        else:
+            self.init_websocket()
 
         if self._owns_ws_manager:
             self.init_websocket()
@@ -69,6 +109,10 @@ class TradingTab(tk.Frame):
         self._create_trade_settings(left_frame)
 
         self.order_tab = OrderTab(left_frame, current_symbol=None, price_callback=self._price_for_symbol)
+        # give OrderTab access to simulation mode + broker
+        self.order_tab.get_execution_mode = lambda: self.execution_mode_var.get()
+        self.order_tab.paper_broker = self.paper_broker
+
         self.order_tab.pack(fill=tk.BOTH, expand=True, pady=10)
         self._propagate_margin_mode()
         self._propagate_isolated_margin()
@@ -89,6 +133,23 @@ class TradingTab(tk.Frame):
     def _create_trade_settings(self, parent):
         settings = tk.LabelFrame(parent, text="Trade Settings")
         settings.pack(fill=tk.X, pady=5)
+        
+        #Live Mode
+        row0 = tk.Frame(settings)
+        row0.pack(fill=tk.X, padx=6, pady=4)
+
+        tk.Label(row0, text="Execution:", width=14, anchor="w").pack(side=tk.LEFT)
+        self.execution_combo = ttk.Combobox(
+            row0,
+            textvariable=self.execution_mode_var,
+            values=["LIVE", "SIM"],
+            state="readonly",
+            width=12,
+        )
+        self.execution_combo.pack(side=tk.LEFT)
+        self.execution_combo.bind("<<ComboboxSelected>>", lambda e: 
+        self.refresh_positions_async())
+
 
         # Margin mode
         row1 = tk.Frame(settings)
@@ -257,8 +318,10 @@ class TradingTab(tk.Frame):
         return positions
 
     def get_positions(self):
-        # Try rest_client
+            
         try:
+            if self.execution_mode_var.get() == "SIM":
+                return self.paper_broker.get_positions()
             if hasattr(rest_client, "get_position_risk"):
                 data = rest_client.get_position_risk()
                 return self._parse_position_list(data)
@@ -336,7 +399,7 @@ class TradingTab(tk.Frame):
         for item in self.positions_tree.get_children():
             self.positions_tree.delete(item)
 
-        for pos in positions:
+        for pos in positions or []:
             try:
                 values = (
                     str(pos.get("symbol", "")),
@@ -371,6 +434,7 @@ class TradingTab(tk.Frame):
         self.ws_manager.start()
 
     def handle_ws_message(self, data):
+        #print("WS event:", data.get("e"), "symbol:", data.get("s"))
         if data.get("e") == "24hrTicker":
             self.handle_ticker_update(data)
         elif data.get("e") == "aggTrade":
@@ -378,14 +442,40 @@ class TradingTab(tk.Frame):
 
     def handle_ticker_update(self, data):
         if data.get("s") == self.current_symbol:
-            self.price_data["current_price"] = float(data.get("c", 0.0))
+            last = float(data.get("c", 0.0))
+            self.price_data["current_price"] = last
             self.price_data["price_change"] = float(data.get("P", 0.0))
             self.update_symbol_info()
 
+            # ADD THIS so SIM can fill even without aggTrade
+            if self.execution_mode_var.get() == "SIM" and last > 0:
+                self.paper_broker.on_price(self.current_symbol, last)
+                self._schedule_sim_positions_refresh()
+
     def handle_price_update(self, data):
-        if data.get("s") == self.current_symbol:
-            self.price_data["current_price"] = float(data.get("p", 0.0))
-            self.update_symbol_info()
+        symbol = data.get("s")
+        if not symbol:
+            return
+
+        # Only process ticks for the selected symbol
+        if symbol != self.current_symbol:
+            return
+
+        try:
+            last = float(data.get("p", 0.0))
+        except Exception:
+            return
+
+        if last <= 0:
+            return
+
+        self.price_data["current_price"] = last
+        self.update_symbol_info()
+
+        # Feed SIM broker so MARKET orders can fill
+        if self.execution_mode_var.get() == "SIM":
+            self.paper_broker.on_price(symbol, last)
+            self._schedule_sim_positions_refresh()
 
     # ------------------------------------------------------
     def _start_mark_price_cache_updater(self):
@@ -479,25 +569,52 @@ class TradingTab(tk.Frame):
                 pass
 
     def close_selected_position(self):
-        pass  # intentionally disabled noisy behavior
+        pos = self._selected_position()
+        if not pos or not pos.get("symbol"):
+            return
+
+        sym = pos["symbol"]
+
+        # SIM
+        if self.execution_mode_var.get() == "SIM":
+            res = self.paper_broker.close_position_market(sym)
+            # refresh table
+            self.refresh_positions_async()
+            return
+
+        # LIVE (optional): call OrderTab close using its existing logic
+        # 1) switch UI symbol so OrderTab closes the same symbol
+        self.on_symbol_select(sym)
+        # 2) then close via OrderTab (uses Binance positionRisk + reduceOnly market)
+        self.order_tab.close_position()
 
     # ------------------------------------------------------
     def on_symbol_select(self, symbol):
-        if self.current_symbol and self.ws_manager and self._owns_ws_manager:
+        prev = self.current_symbol
+
+        # Unsubscribe from previous symbol
+        if prev and self.ws_manager and self._owns_ws_manager:
             try:
-                self.ws_manager.unsubscribe(self.current_symbol)
+                self.ws_manager.unsubscribe(prev)
             except Exception:
                 pass
 
+        # Set new symbol
         self.current_symbol = symbol
+        self.currentsymbol = symbol  # legacy alias (optional)
+
+        # Reset per-symbol UI state
         self.price_data = {}
+        self.pricedata = self.price_data  # legacy alias (optional)
         self.ratio_data = {}
         self.cnd_rating = "N/A"
+
         self.create_symbol_info_widgets()
         self.order_tab.update_symbol(symbol)
         self._propagate_margin_mode()
         self._propagate_isolated_margin()
 
+        # Subscribe to new symbol
         if symbol and self.ws_manager:
             try:
                 self.ws_manager.subscribe(symbol)

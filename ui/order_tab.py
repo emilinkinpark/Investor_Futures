@@ -172,7 +172,7 @@ class OrderTab(tk.Frame):
         # Actions
         action_frame = tk.Frame(main_frame)
         action_frame.pack(fill=tk.X, pady=10)
-        tk.Button(action_frame, text="Place Order", command=self.place_order).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame, text="Place Order", command=self.placeorder).pack(side=tk.LEFT, padx=5)
         tk.Button(action_frame, text="Close Position", command=self.close_position).pack(side=tk.LEFT, padx=5)
         tk.Button(action_frame, text="Refresh", command=self.force_refresh).pack(side=tk.LEFT, padx=5)
 
@@ -186,29 +186,26 @@ class OrderTab(tk.Frame):
         self.price_updater.start()
 
     def update_price_display(self):
-        if self.current_symbol:
-            # Always prefer price_callback (TradingTab provides websocket/mark cache)
-            if self.price_callback:
-                try:
-                    price = self.price_callback(self.current_symbol)
-                except Exception:
-                    price = None
-            else:
-                price = None  # no direct HTTP fallback here
+        price = None
+        if self.current_symbol and self.price_callback:
+            try:
+                price = self.price_callback(self.current_symbol)
+            except Exception:
+                price = None
 
-            if price is not None and price > 0 and price != self.current_price:
-                color = 'green' if price >= self.current_price else 'red'
-                self.current_price = price
-                price_text = f"Price: {price:.6f}"
-                self.price_display.config(text=price_text, fg=color)
+        if price is not None and price > 0 and price != self.current_price:
+            color = 'green' if price >= self.current_price else 'red'
+            self.current_price = float(price)
+            self.price_display.config(text=f"Price: {self.current_price:.6f}", fg=color)
 
-                if self.order_type == "LIMIT" and not self.price_entry.get():
-                    self.price_entry.config(state=tk.NORMAL)
-                    self.price_entry.delete(0, tk.END)
-                    self.price_entry.insert(0, f"{price:.6f}")
-                    self.price_entry.config(state=tk.NORMAL)
+            if self.order_type == "LIMIT" and not self.price_entry.get():
+                self.price_entry.config(state=tk.NORMAL)
+                self.price_entry.delete(0, tk.END)
+                self.price_entry.insert(0, f"{self.current_price:.6f}")
+                self.price_entry.config(state=tk.NORMAL)
 
         self.start_price_updater()
+
 
     def update_position_side(self):
         self.position_side = self.side_var.get()
@@ -334,13 +331,21 @@ class OrderTab(tk.Frame):
 
     # ---------- Leverage ----------
     def set_leverage(self):
-        leverage = self.leverage_var.get()
+        leverage = float(self.leverage_var.get() or 1)
+
         if not self.current_symbol:
             messagebox.showerror("Error", "No symbol selected")
             return
+
+        # SIM: no Binance call
+        if self._is_sim():
+            messagebox.showinfo("SIM", f"Leverage set to {int(leverage)}x for {self.current_symbol} (SIM)")
+            return
+
+        # LIVE: existing behavior
         try:
-            self._signed_post("/fapi/v1/leverage", {"symbol": self.current_symbol, "leverage": leverage})
-            messagebox.showinfo("Success", f"Leverage set to {leverage}x for {self.current_symbol}")
+            self._signed_post("/fapi/v1/leverage", {"symbol": self.current_symbol, "leverage": int(leverage)})
+            messagebox.showinfo("Success", f"Leverage set to {int(leverage)}x for {self.current_symbol}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to set leverage: {str(e)}")
 
@@ -357,141 +362,247 @@ class OrderTab(tk.Frame):
         resp.raise_for_status()
         return resp
 
+
     # ---------- Order flow ----------
-    def place_order(self):
-        if not self.current_symbol:
+    def placeorder(self):
+         # --- compatibility aliases (old names used below) ---
+        self.currentsymbol = self.current_symbol
+        self.ordertype = self.order_type
+        self.positionside = self.position_side
+        self.marginmode = self.margin_mode
+        self.isolatedmarginusdt = self.isolated_margin_usdt
+        self.isolatedinputmode = self.isolated_input_mode
+        self.leveragevar = self.leverage_var
+
+        self.usdtentry = self.usdt_entry
+        self.qtyentry = self.qty_entry
+        self.tpvar = self.tp_var
+        self.slvar = self.sl_var
+
+        self.currentprice = self.current_price  # used for MARKET sizing below
+
+        if not self.currentsymbol:
+            messagebox.showerror("Error", "No symbol selected")
+            return
+        
+        if not self.currentsymbol:
             messagebox.showerror("Error", "No symbol selected")
             return
 
+        # Determine execution mode (SIM vs LIVE)
         try:
-            # Ensure leverage & marginType are applied first
-            lev = int(float(self.leverage_var.get()))
-            self._signed_post("/fapi/v1/leverage", {"symbol": self.current_symbol, "leverage": lev})
+            is_sim = hasattr(self, "get_execution_mode") and self.get_execution_mode() == "SIM"
+        except Exception:
+            is_sim = False
 
-            # margin type
-            mt = "ISOLATED" if self.margin_mode == "Isolated" else "CROSSED"
-            try:
-                self._signed_post("/fapi/v1/marginType", {"symbol": self.current_symbol, "marginType": mt})
-            except requests.exceptions.HTTPError as e:
-                # -4046 already in this margin type; treat as OK
+        try:
+            # ---------- Order flow ----------
+            lev = int(float(self.leveragevar.get() or 1))
+
+            # LIVE only: set leverage + marginType on Binance
+            if not is_sim:
+                self._signed_post("/fapi/v1/leverage", {"symbol": self.currentsymbol, "leverage": lev})
+
+                mt = "ISOLATED" if self.marginmode == "Isolated" else "CROSSED"
                 try:
-                    data = e.response.json()
-                    if data.get("code") not in (-4046, -4048):
+                    self._signed_post("/fapi/v1/marginType", {"symbol": self.currentsymbol, "marginType": mt})
+                except requests.exceptions.HTTPError as e:
+                    # -4046 already in this margin type; treat as OK
+                    try:
+                        data = e.response.json()
+                        if data.get("code") not in (-4046, -4048):
+                            raise
+                    except Exception:
                         raise
-                except Exception:
-                    raise
 
             # Determine price for notional/limit validation
-            if self.order_type == "LIMIT":
+            if self.ordertype == "LIMIT":
                 price = self.validate_price()
-                price = self.format_price(price, self.current_symbol)
+                price = self.format_price(price, self.currentsymbol)
             else:
                 # For MARKET, rely on current websocket/mark price from TradingTab
-                price = float(self.current_price or 0.0)
-            if price <= 0:
-                raise ValueError("No valid mark price to compute quantity")
+                price = float(self.currentprice or 0.0)
+                if price <= 0:
+                    raise ValueError("No valid mark price to compute quantity")
 
             # ---- Quantity sizing ----
-            if self.margin_mode == "Isolated":
-                if self.isolated_margin_usdt <= 0:
+            if self.marginmode == "Isolated":
+                if self.isolatedmarginusdt <= 0:
                     raise ValueError("Enter a positive Isolated Amount (USDT)")
 
-                if (self.isolated_input_mode or "").startswith("Margin"):
-                    desired_notional = self.isolated_margin_usdt * max(lev, 1)
-                    user_margin = self.isolated_margin_usdt
+                if (self.isolatedinputmode or "").startswith("Margin"):
+                    desirednotional = self.isolatedmarginusdt * max(lev, 1)
+                    usermargin = self.isolatedmarginusdt
                 else:
                     # Default: treat input as final notional, regardless of leverage
-                    desired_notional = self.isolated_margin_usdt
-                    user_margin = desired_notional / max(lev, 1)
+                    desirednotional = self.isolatedmarginusdt
+                    usermargin = desirednotional / max(lev, 1)
 
-                raw_qty = desired_notional / price
-                quantity = self.format_quantity(raw_qty, self.current_symbol)
+                rawqty = desirednotional / price
+                quantity = self.format_quantity(rawqty, self.currentsymbol)
+
             else:
                 # Cross: use the USDT box (if filled) or quantity box
                 try:
-                    usdt_box = float(self.usdt_entry.get() or 0.0)
+                    usdtbox = float(self.usdtentry.get() or 0.0)
                 except ValueError:
-                    usdt_box = 0.0
-                if usdt_box > 0:
-                    raw_qty = usdt_box / price
-                    quantity = self.format_quantity(raw_qty, self.current_symbol)
-                    desired_notional = usdt_box
+                    usdtbox = 0.0
+
+                if usdtbox > 0:
+                    rawqty = usdtbox / price
+                    quantity = self.format_quantity(rawqty, self.currentsymbol)
+                    desirednotional = usdtbox
                 else:
                     quantity = self.validate_quantity()
-                    quantity = self.format_quantity(quantity, self.current_symbol)
-                    desired_notional = quantity * price
-                user_margin = None  # N/A for Cross
+                    quantity = self.format_quantity(quantity, self.currentsymbol)
+                    desirednotional = quantity * price
+
+                usermargin = None  # N/A for Cross
 
             if quantity <= 0:
                 raise ValueError("Computed quantity is too small for this symbol")
 
             # Enforce exchange minimums (symbol filters are preloaded in background)
-            min_qty = self.get_min_qty(self.current_symbol)
-            min_notional = self.get_min_notional(self.current_symbol)  # often ~5.0
+            minqty = self.get_min_qty(self.currentsymbol)
+            minnotional = self.get_min_notional(self.currentsymbol)  # often ~5.0
+
             notional = price * quantity
 
-            if quantity < min_qty:
-                quantity = self._ceil_to_step(min_qty, self.get_step_size(self.current_symbol))
+            if quantity < minqty:
+                quantity = self._ceil_to_step(minqty, self.get_step_size(self.currentsymbol))
                 notional = price * quantity
 
-            if notional < min_notional:
-                step = self.get_step_size(self.current_symbol)
-                needed = self._ceil_to_step(max(min_notional / max(price, 1e-12), min_qty), step)
-                self.qty_entry.delete(0, tk.END)
-                self.qty_entry.insert(0, f"{needed}")
+            if notional < minnotional:
+                step = self.get_step_size(self.currentsymbol)
+                needed = self._ceil_to_step(max(minnotional / max(price, 1e-12), minqty), step)
+                self.qtyentry.delete(0, tk.END)
+                self.qtyentry.insert(0, f"{needed}")
                 self._update_usdt_display(needed, price)
                 raise ValueError(
-                    f"Order notional {notional:.4f} < minimum {min_notional:.2f}. "
+                    f"Order notional {notional:.4f} < minimum {minnotional:.2f}. "
                     f"Adjusted quantity to {needed}."
                 )
 
-            # TP/SL values (optional)
-            tp_price = self.validate_tp_sl('take profit') if self.tp_var.get() else None
-            sl_price = self.validate_tp_sl('stop loss') if self.sl_var.get() else None
-            if tp_price:
-                tp_price = self.format_price(tp_price, self.current_symbol)
-            if sl_price:
-                sl_price = self.format_price(sl_price, self.current_symbol)
+            # TP/SL values (optional) - (kept as validation only; SIM does not auto-place TP/SL orders here)
+            tpprice = self.validate_tp_sl("take profit") if self.tpvar.get() else None
+            slprice = self.validate_tp_sl("stop loss") if self.slvar.get() else None
+            if tpprice:
+                tpprice = self.format_price(tpprice, self.currentsymbol)
+            if slprice:
+                slprice = self.format_price(slprice, self.currentsymbol)
 
             # Confirmation
             extra = []
-            if self.margin_mode == "Isolated":
+            if self.marginmode == "Isolated":
                 extra.append(f"Leverage: {lev}x")
-                extra.append(f"Initial Margin: {user_margin:.2f} USDT")
-                extra.append(f"Input Mode: {self.isolated_input_mode}")
+                extra.append(f"Initial Margin: {usermargin:.2f} USDT")
+                extra.append(f"Input Mode: {self.isolatedinputmode}")
+
             if not self.show_confirmation(
                 quantity,
-                (price if self.order_type == "LIMIT" else None),
-                tp_price,
-                sl_price,
+                (price if self.ordertype == "LIMIT" else None),
+                tpprice,
+                slprice,
                 notional,
                 extra_lines=extra
             ):
                 return
 
-            # Prepare and send order
-            params = {
-                'symbol': self.current_symbol,
-                'side': 'BUY' if self.position_side == 'LONG' else 'SELL',
-                'type': self.order_type,
-                'quantity': quantity,
-            }
-            if self.order_type == "LIMIT":
-                params['price'] = price
-                params['timeInForce'] = 'GTC'
+            # ---------- SIM execution ----------
+            if is_sim:
+                if not hasattr(self, "paper_broker") or self.paper_broker is None:
+                    raise RuntimeError("SIM mode enabled but paper_broker is not set on OrderTab")
 
-            # NOTE: If you run hedge mode, add positionSide here
+                entry_side = "BUY" if self.positionside == "LONG" else "SELL"
+                limitprice = price if self.ordertype == "LIMIT" else None
+            # ---------- SIM isolated cap enforcement ----------
+                if self.marginmode == "Isolated":
+                    cap = float(self.isolatedmarginusdt or 0.0)
+                    if cap <= 0:
+                        raise ValueError("Enter a positive Isolated Amount (USDT)")
+
+                    positions = (self.paper_broker.get_positions() or [])
+                    cur = next((p for p in positions if p.get("symbol") == self.currentsymbol), None)
+
+                    used_notional = 0.0
+                    if cur:
+                        entry0 = float(cur.get("entry") or 0.0)
+                        size0  = float(cur.get("size") or 0.0)
+                        used_notional = size0 * entry0
+
+                    need_notional = float(desirednotional or 0.0)  # computed earlier in sizing
+
+                    if used_notional + need_notional > cap + 1e-9:
+                        raise ValueError(
+                            f"SIM Isolated cap exceeded for {self.currentsymbol}: "
+                            f"used {used_notional:.2f} + new {need_notional:.2f} > cap {cap:.2f} USDT"
+                        )
+
+                # Place entry
+                entry = self.paper_broker.place_order(
+                    symbol=self.currentsymbol,
+                    side=entry_side,
+                    order_type=self.ordertype,
+                    qty=quantity,
+                    limit_price=limitprice,
+                    reduce_only=False,
+                    leverage=lev,
+                    isolated_margin_usdt=float(usermargin or 0.0),
+                )
+
+                # Place bracket exits (TP/SL) as reduce-only conditionals (simple OCO)
+                exit_side = "SELL" if entry_side == "BUY" else "BUY"
+                oco = f"OCO-{self.currentsymbol}-{entry.get('orderId')}"
+
+                if tpprice is not None:
+                    self.paper_broker.place_order(
+                        symbol=self.currentsymbol,
+                        side=exit_side,
+                        order_type="TAKE_PROFIT_MARKET",
+                        qty=quantity,
+                        stop_price=float(tpprice),
+                        reduce_only=True,
+                        leverage=lev,
+                        oco_group=oco,
+                    )
+
+                if slprice is not None:
+                    self.paper_broker.place_order(
+                        symbol=self.currentsymbol,
+                        side=exit_side,
+                        order_type="STOP_MARKET",
+                        qty=quantity,
+                        stop_price=float(slprice),
+                        reduce_only=True,
+                        leverage=lev,
+                        oco_group=oco,
+                    )
+
+                self.show_order_success(entry)
+                return
+
+            # ---------- LIVE execution (existing behavior) ----------
+            params = {
+                "symbol": self.currentsymbol,
+                "side": "BUY" if self.positionside == "LONG" else "SELL",
+                "type": self.ordertype,
+                "quantity": quantity,
+            }
+            if self.ordertype == "LIMIT":
+                params["price"] = price
+                params["timeInForce"] = "GTC"
 
             resp = self._signed_post("/fapi/v1/order", params)
-            order_data = resp.json()
-            self.show_order_success(order_data)
+            orderdata = resp.json()
+            self.show_order_success(orderdata)
 
         except ValueError as e:
             messagebox.showerror("Input Error", str(e))
         except requests.exceptions.RequestException as e:
-            self.handle_api_error(e, {'symbol': self.current_symbol})
+            self.handle_api_error(e, {"symbol": self.currentsymbol})
         except Exception as e:
             messagebox.showerror("System Error", f"Unexpected error: {str(e)}")
+
 
     def validate_quantity(self):
         try:
@@ -663,7 +774,17 @@ class OrderTab(tk.Frame):
         if not self.current_symbol:
             messagebox.showerror("Error", "No symbol selected")
             return
-
+        # SIM close
+        if self._is_sim():
+            if not getattr(self, "paper_broker", None):
+                messagebox.showerror("Error", "SIM mode enabled but paper_broker is not set")
+                return
+            res = self.paper_broker.close_position_market(self.current_symbol)
+            if not res:
+                messagebox.showinfo("Info", f"No open SIM position for {self.current_symbol}")
+            else:
+                messagebox.showinfo("Success", f"SIM position closed for {self.current_symbol}")
+            return
         try:
             headers = {'X-MBX-APIKEY': API_KEY}
             ts = int(time.time() * 1000)
@@ -745,3 +866,9 @@ class OrderTab(tk.Frame):
         if self.price_updater:
             self.price_updater.cancel()
         super().destroy()
+
+    def _is_sim(self) -> bool:
+        try:
+            return hasattr(self, "get_execution_mode") and self.get_execution_mode() == "SIM"
+        except Exception:
+            return False

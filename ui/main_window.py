@@ -66,6 +66,8 @@ def run_app():
     # Tabs
     # -------------------------------------------------
     trading_tab = TradingTab(notebook, ws_manager)
+    # IMPORTANT: route WS messages into TradingTab
+    ws_manager.on_message_callback = trading_tab.handle_ws_message
     notebook.add(trading_tab, text="Trading")
 
     auto_order_tab = AutoOrderFrame(notebook)
